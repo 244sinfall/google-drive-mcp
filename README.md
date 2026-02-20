@@ -1,6 +1,6 @@
 # Google Drive MCP Server
 
-A Model Context Protocol (MCP) server that provides secure integration with Google Drive, Docs, Sheets, and Slides. It allows Claude Desktop and other MCP clients to manage files in Google Drive through a standardized interface.
+A Model Context Protocol (MCP) server that provides secure integration with Google Drive, Docs, Sheets, and Slides. It is designed for Streamable HTTP deployments used by MCP gateways and remote clients.
 
 ## Features
 
@@ -11,6 +11,7 @@ A Model Context Protocol (MCP) server that provides secure integration with Goog
 - **Folder Navigation**: List and navigate through folder hierarchies with path support (e.g., `/Work/Projects`)
 - **MCP Resource Protocol**: Files accessible as MCP resources for reading content
 - **Secure Authentication**: OAuth 2.0 with automatic token refresh
+- **Streamable HTTP Transport**: Exposes MCP over HTTP (`/mcp`) for gateway/upstream architectures
 
 ## Example Usage
 
@@ -116,186 +117,178 @@ and Budget Spreadsheet template.
 
 ### Option 1: Use with npx (Recommended)
 
-You can run the server directly without installation:
-
 ```bash
-# Run the server (authentication happens automatically on first run)
-npx @piotr-agier/google-drive-mcp
-
-# Optional: Run authentication manually if needed
+# 1) Run browser authentication once
 npx @piotr-agier/google-drive-mcp auth
+
+# 2) Start Streamable HTTP MCP server
+npx @piotr-agier/google-drive-mcp start
 ```
 
 ### Option 2: Local Installation
 
-1. Clone and install:
-   ```bash
-   git clone https://github.com/piotr-agier/google-drive-mcp.git
-   cd google-drive-mcp
-   npm install
-   ```
+```bash
+git clone https://github.com/piotr-agier/google-drive-mcp.git
+cd google-drive-mcp
+npm install
+npm run build
+```
 
-2. Set up credentials:
-   ```bash
-   # Copy the example file
-   cp gcp-oauth.keys.example.json gcp-oauth.keys.json
-   
-   # Edit gcp-oauth.keys.json with your OAuth client ID
-   ```
-
-3. Authenticate (optional):
-   ```bash
-   npm run auth
-   ```
-   
-   Note: Authentication happens automatically on first run of an MCP client if you skip this step.
-
-## Docker Usage
-
-### Prerequisites
-
-1. **Authenticate locally first** - Docker containers cannot open browsers for OAuth:
-   ```bash
-   # Using npx
-   npx @piotr-agier/google-drive-mcp auth
-   
-   # Or using local installation
-   npm run auth
-   ```
-
-2. **Verify token location**:
-   ```bash
-   ls -la ~/.config/google-drive-mcp/tokens.json
-   ```
-
-### Building the Docker Image
-
-1. **Build the project** (required before Docker build):
-   ```bash
-   npm install
-   npm run build
-   ```
-
-2. **Build the Docker image**:
-   ```bash
-   docker build -t google-drive-mcp .
-   ```
-
-### Running the Docker Container
-
-Run the container with your credentials and tokens mounted:
+Then:
 
 ```bash
-docker run -it \
+# 1) Browser auth
+npm run auth
+
+# 2) Start server
+npm start
+```
+
+## Quick Start: Local OAuth + HTTP Server
+
+1. Place OAuth desktop credentials at `gcp-oauth.keys.json` or set:
+   ```bash
+   export GOOGLE_DRIVE_OAUTH_CREDENTIALS="/absolute/path/gcp-oauth.keys.json"
+   ```
+2. Run local browser authorization:
+   ```bash
+   npx @piotr-agier/google-drive-mcp auth
+   ```
+3. Start Streamable HTTP MCP server:
+   ```bash
+   export GOOGLE_DRIVE_MCP_HOST="127.0.0.1"
+   export GOOGLE_DRIVE_MCP_PORT="3000"
+   export GOOGLE_DRIVE_MCP_PATH="/mcp"
+   npx @piotr-agier/google-drive-mcp start
+   ```
+4. Health check:
+   ```bash
+   curl http://127.0.0.1:3000/healthz
+   ```
+
+## Deploying With Pre-Generated Tokens
+
+This is the recommended flow when your runtime environment cannot open a browser.
+
+1. Authorize locally on a machine with browser access:
+   ```bash
+   export GOOGLE_DRIVE_OAUTH_CREDENTIALS="/absolute/path/gcp-oauth.keys.json"
+   export GOOGLE_DRIVE_MCP_TOKEN_PATH="/absolute/path/tokens.json"
+   npx @piotr-agier/google-drive-mcp auth
+   ```
+2. Copy both files to the deployment environment:
+   - `gcp-oauth.keys.json`
+   - `tokens.json`
+3. Set runtime env vars:
+   ```bash
+   export GOOGLE_DRIVE_OAUTH_CREDENTIALS="/run/secrets/gcp-oauth.keys.json"
+   export GOOGLE_DRIVE_MCP_TOKEN_PATH="/run/secrets/tokens.json"
+   ```
+4. Start the server:
+   ```bash
+   npx @piotr-agier/google-drive-mcp start
+   ```
+
+### Environment-Only Variant (Railway Friendly)
+
+If your platform does not use mounted files, pass credentials and tokens as environment variables:
+
+```bash
+# OAuth credentials JSON (base64-encoded)
+GOOGLE_DRIVE_OAUTH_CREDENTIALS_JSON_BASE64=...
+
+# OAuth tokens JSON (base64-encoded)
+GOOGLE_DRIVE_MCP_TOKENS_JSON_BASE64=...
+
+GOOGLE_DRIVE_MCP_HOST=0.0.0.0
+GOOGLE_DRIVE_MCP_PORT=3000
+GOOGLE_DRIVE_MCP_PATH=/mcp
+```
+
+Generate base64 values from local files:
+
+```bash
+base64 -w 0 gcp-oauth.keys.json > oauth.b64
+base64 -w 0 tokens.json > tokens.b64
+```
+
+On macOS (BSD `base64`):
+
+```bash
+base64 < gcp-oauth.keys.json | tr -d '\n' > oauth.b64
+base64 < tokens.json | tr -d '\n' > tokens.b64
+```
+
+Notes:
+- You still run browser auth once on a local machine to obtain the initial `tokens.json`.
+- In env-token mode, refreshed tokens are kept in memory only; update your env var when you rotate tokens.
+
+## Docker Usage (HTTP)
+
+### 1) Build image
+
+```bash
+npm install
+npm run build
+docker build -t google-drive-mcp .
+```
+
+### 2) Run container
+
+```bash
+docker run --rm -p 3000:3000 \
   -v /path/to/gcp-oauth.keys.json:/config/gcp-oauth.keys.json:ro \
-  -v ~/.config/google-drive-mcp/tokens.json:/config/tokens.json \
+  -v /path/to/tokens.json:/config/tokens.json \
+  -e GOOGLE_DRIVE_MCP_HOST=0.0.0.0 \
+  -e GOOGLE_DRIVE_MCP_PORT=3000 \
+  -e GOOGLE_DRIVE_MCP_PATH=/mcp \
   google-drive-mcp
 ```
 
-**Important Notes:**
-- Replace `/path/to/gcp-oauth.keys.json` with the actual path to your OAuth credentials
-- The `:ro` flag mounts the credentials as read-only for security
-- Tokens are mounted read-write to allow automatic refresh
-- The container runs as non-root user for security
-
-### Docker Configuration for Claude Desktop
-
-Add this configuration to use the Docker container with Claude Desktop:
-
-```json
-{
-  "mcpServers": {
-    "google-drive": {
-      "command": "docker",
-      "args": [
-        "run",
-        "-i",
-        "--rm",
-        "-v",
-        "/path/to/gcp-oauth.keys.json:/config/gcp-oauth.keys.json:ro",
-        "-v",
-        "/Users/yourname/.config/google-drive-mcp/tokens.json:/config/tokens.json",
-        "google-drive-mcp"
-      ]
-    }
-  }
-}
-```
-
-**Docker-specific notes:**
-- Uses `-i` for interactive mode (required for MCP stdio communication)
-- Uses `--rm` to automatically remove the container after exit
-- No port mapping needed (MCP uses stdio, not HTTP)
-- Environment variables are set in the Dockerfile
+Notes:
+- Credentials should be mounted read-only.
+- Token file must be writable so refresh can persist.
+- Port mapping is required because MCP transport is HTTP.
 
 ## Configuration
 
-### OAuth Credentials Configuration
+### OAuth Credentials
 
-The server supports multiple methods for providing OAuth credentials (in order of priority):
+The server loads OAuth credentials in this order:
 
-#### 1. **Environment Variable** (Recommended)
-```bash
-export GOOGLE_DRIVE_OAUTH_CREDENTIALS="/path/to/your/gcp-oauth.keys.json"
-```
-
-#### 2. **Default File Location**
-Place `gcp-oauth.keys.json` in the project root directory
+1. `GOOGLE_DRIVE_OAUTH_CREDENTIALS_JSON`
+2. `GOOGLE_DRIVE_OAUTH_CREDENTIALS_JSON_BASE64` (or `GOOGLE_DRIVE_OAUTH_CREDENTIALS_BASE64`)
+3. `GOOGLE_DRIVE_OAUTH_CREDENTIALS`
+4. `./gcp-oauth.keys.json` in project root
 
 ### Token Storage
 
-Authentication tokens are stored securely following the XDG Base Directory specification:
+Token loading priority:
 
-| Priority | Location | Configuration |
+| Priority | Source | Configuration |
 |----------|----------|---------------|
-| 1 | Custom path | Set `GOOGLE_DRIVE_MCP_TOKEN_PATH` environment variable |
-| 2 | XDG Config | `$XDG_CONFIG_HOME/google-drive-mcp/tokens.json` |
-| 3 | Default | `~/.config/google-drive-mcp/tokens.json` |
+| 1 | Env JSON | `GOOGLE_DRIVE_MCP_TOKENS_JSON` |
+| 2 | Env base64 | `GOOGLE_DRIVE_MCP_TOKENS_JSON_BASE64` (or `GOOGLE_DRIVE_MCP_TOKENS_BASE64`) |
+| 3 | Custom file path | `GOOGLE_DRIVE_MCP_TOKEN_PATH` |
+| 4 | XDG Config | `$XDG_CONFIG_HOME/google-drive-mcp/tokens.json` |
+| 5 | Default | `~/.config/google-drive-mcp/tokens.json` |
 
-**Security Notes:**
-- Tokens are created with secure permissions (0600)
-- Never commit tokens to version control
-- Tokens auto-refresh before expiration
-- Google OAuth apps in "Testing" status have refresh tokens that expire after 7 days (Google's policy)
+### HTTP Transport Configuration
 
-## Usage with Claude Desktop
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GOOGLE_DRIVE_MCP_HOST` | HTTP bind host | `127.0.0.1` |
+| `GOOGLE_DRIVE_MCP_PORT` | HTTP bind port | `3000` |
+| `GOOGLE_DRIVE_MCP_PATH` | MCP endpoint path | `/mcp` |
+| `GOOGLE_DRIVE_MCP_ENABLE_DNS_REBINDING_PROTECTION` | Enable host/origin header checks | `false` |
+| `GOOGLE_DRIVE_MCP_ALLOWED_HOSTS` | Comma-separated allowed `Host` values | unset |
+| `GOOGLE_DRIVE_MCP_ALLOWED_ORIGINS` | Comma-separated allowed `Origin` values | unset |
 
-Add the server to your Claude Desktop configuration:
-
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-
-### Using npx (Recommended):
-```json
-{
-  "mcpServers": {
-    "google-drive": {
-      "command": "npx",
-      "args": ["@piotr-agier/google-drive-mcp"],
-      "env": {
-        "GOOGLE_DRIVE_OAUTH_CREDENTIALS": "/path/to/your/gcp-oauth.keys.json"
-      }
-    }
-  }
-}
-```
-
-### Using Local Installation:
-```json
-{
-  "mcpServers": {
-    "google-drive": {
-      "command": "node",
-      "args": ["/absolute/path/to/google-drive-mcp/dist/index.js"],
-      "env": {
-        "GOOGLE_DRIVE_OAUTH_CREDENTIALS": "/path/to/your/gcp-oauth.keys.json"
-      }
-    }
-  }
-}
-```
-
-**Note**: Replace `/path/to/your/gcp-oauth.keys.json` with the actual path to your OAuth credentials file.
+Security notes:
+- Tokens are created with `0600` permissions.
+- Never commit credential or token files.
+- Google OAuth apps in "Testing" may expire refresh tokens after 7 days.
+- If tokens are loaded from env vars, token refresh updates are in-memory only.
 
 ## Available Tools
 
@@ -693,9 +686,12 @@ npx @piotr-agier/google-drive-mcp auth
 ls -la ~/.config/google-drive-mcp/tokens.json
 
 # 3. Run Docker with tokens mounted
-docker run -it \
+docker run --rm -p 3000:3000 \
   -v $(pwd)/gcp-oauth.keys.json:/config/gcp-oauth.keys.json:ro \
   -v ~/.config/google-drive-mcp/tokens.json:/config/tokens.json \
+  -e GOOGLE_DRIVE_MCP_HOST=0.0.0.0 \
+  -e GOOGLE_DRIVE_MCP_PORT=3000 \
+  -e GOOGLE_DRIVE_MCP_PATH=/mcp \
   google-drive-mcp
 ```
 
@@ -732,7 +728,7 @@ Enable detailed logging:
 ```bash
 # Set debug environment variable
 export DEBUG=google-drive-mcp:*
-npx @piotr-agier/google-drive-mcp
+npx @piotr-agier/google-drive-mcp start
 ```
 
 ### Getting Help
@@ -781,7 +777,7 @@ npm run typecheck # Type checking without compilation
 - `npm run typecheck` - Run TypeScript type checking only
 - `npm run lint` - Run TypeScript type checking (alias for typecheck)
 - `npm run prepare` - Auto-runs build before npm publish
-- `npm test` - Run tests (placeholder - no tests implemented yet)
+- `npm test` - Run unit tests
 
 ## Advanced Configuration
 
@@ -792,13 +788,23 @@ npm run typecheck # Type checking without compilation
 **Credentials** (required - use one of these methods):
 | Variable | Description | Example |
 |----------|-------------|---------|
+| `GOOGLE_DRIVE_OAUTH_CREDENTIALS_JSON` | Raw OAuth credentials JSON content | `{"installed":{...}}` |
+| `GOOGLE_DRIVE_OAUTH_CREDENTIALS_JSON_BASE64` | Base64 OAuth credentials JSON | `eyJpbnN0YWxsZWQiOn...` |
 | `GOOGLE_DRIVE_OAUTH_CREDENTIALS` | Path to your OAuth credentials JSON file | `/home/user/secrets/oauth.json` |
 | *(or place file at)* | Default location: `gcp-oauth.keys.json` in project root | `./gcp-oauth.keys.json` |
 
 **Optional** (for customization):
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
+| `GOOGLE_DRIVE_MCP_TOKENS_JSON` | Raw OAuth tokens JSON content | `{"access_token":"...","refresh_token":"..."}` |
+| `GOOGLE_DRIVE_MCP_TOKENS_JSON_BASE64` | Base64 OAuth tokens JSON | `eyJhY2Nlc3NfdG9rZW4iOi...` |
 | `GOOGLE_DRIVE_MCP_TOKEN_PATH` | Override token storage location | `~/.config/google-drive-mcp/tokens.json` | `/custom/path/tokens.json` |
+| `GOOGLE_DRIVE_MCP_HOST` | HTTP bind host | `127.0.0.1` | `0.0.0.0` |
+| `GOOGLE_DRIVE_MCP_PORT` | HTTP bind port | `3000` | `8080` |
+| `GOOGLE_DRIVE_MCP_PATH` | MCP endpoint path | `/mcp` | `/google-drive/mcp` |
+| `GOOGLE_DRIVE_MCP_ENABLE_DNS_REBINDING_PROTECTION` | Enable host/origin checks | `false` | `true` |
+| `GOOGLE_DRIVE_MCP_ALLOWED_HOSTS` | Comma-separated allowed Host values | unset | `127.0.0.1:3000,mcp.internal` |
+| `GOOGLE_DRIVE_MCP_ALLOWED_ORIGINS` | Comma-separated allowed Origin values | unset | `https://gateway.example.com` |
 | `DEBUG` | Enable debug logging | (disabled) | `google-drive-mcp:*` |
 
 #### System Variables (used by the codebase if present)

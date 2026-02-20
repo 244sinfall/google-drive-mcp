@@ -20,6 +20,11 @@ RUN mkdir -p /config
 ENV NODE_ENV=production
 ENV GOOGLE_DRIVE_OAUTH_CREDENTIALS=/config/gcp-oauth.keys.json
 ENV GOOGLE_DRIVE_MCP_TOKEN_PATH=/config/tokens.json
+ENV GOOGLE_DRIVE_MCP_HOST=0.0.0.0
+ENV GOOGLE_DRIVE_MCP_PORT=3000
+
+# Streamable HTTP MCP endpoint
+EXPOSE 3000
 
 # Make the main script executable
 RUN chmod +x dist/index.js

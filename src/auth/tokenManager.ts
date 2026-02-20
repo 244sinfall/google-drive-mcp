@@ -1,12 +1,17 @@
-import { OAuth2Client, Credentials } from 'google-auth-library';
-import * as fs from 'fs/promises';
-import * as path from 'path';
-import { getSecureTokenPath, getLegacyTokenPath, getAdditionalLegacyPaths } from './utils.js';
-import { GaxiosError } from 'gaxios';
+import { OAuth2Client, Credentials } from "google-auth-library";
+import * as fs from "fs/promises";
+import * as path from "path";
+import {
+  getSecureTokenPath,
+  getLegacyTokenPath,
+  getAdditionalLegacyPaths,
+} from "./utils.js";
+import { GaxiosError } from "gaxios";
 
 export class TokenManager {
   private oauth2Client: OAuth2Client;
   private tokenPath: string;
+  private usingEnvTokens: boolean = false;
 
   constructor(oauth2Client: OAuth2Client) {
     this.oauth2Client = oauth2Client;
@@ -21,101 +26,207 @@ export class TokenManager {
 
   private async ensureTokenDirectoryExists(): Promise<void> {
     try {
-        const dir = path.dirname(this.tokenPath);
-        await fs.mkdir(dir, { recursive: true });
+      const dir = path.dirname(this.tokenPath);
+      await fs.mkdir(dir, { recursive: true });
     } catch (error: unknown) {
-        // Ignore errors if directory already exists, re-throw others
-        if (error instanceof Error && 'code' in error && (error as any).code !== 'EEXIST') {
-            console.error('Failed to create token directory:', error);
-            throw error;
-        }
+      // Ignore errors if directory already exists, re-throw others
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        (error as any).code !== "EEXIST"
+      ) {
+        console.error("Failed to create token directory:", error);
+        throw error;
+      }
     }
   }
 
   private setupTokenRefresh(): void {
     this.oauth2Client.on("tokens", async (newTokens) => {
-      try {
-        await this.ensureTokenDirectoryExists();
-        const currentTokens = JSON.parse(await fs.readFile(this.tokenPath, "utf-8"));
+      if (this.usingEnvTokens) {
+        const currentTokens = this.oauth2Client.credentials || {};
         const updatedTokens = {
           ...currentTokens,
           ...newTokens,
           refresh_token: newTokens.refresh_token || currentTokens.refresh_token,
         };
-        await fs.writeFile(this.tokenPath, JSON.stringify(updatedTokens, null, 2), {
-          mode: 0o600,
-        });
+        this.oauth2Client.setCredentials(updatedTokens);
+        console.error(
+          "Tokens refreshed in memory (env token mode). Update GOOGLE_DRIVE_MCP_TOKENS_JSON or GOOGLE_DRIVE_MCP_TOKENS_JSON_BASE64 to persist across restarts.",
+        );
+        return;
+      }
+
+      try {
+        await this.ensureTokenDirectoryExists();
+        const currentTokens = JSON.parse(
+          await fs.readFile(this.tokenPath, "utf-8"),
+        );
+        const updatedTokens = {
+          ...currentTokens,
+          ...newTokens,
+          refresh_token: newTokens.refresh_token || currentTokens.refresh_token,
+        };
+        await fs.writeFile(
+          this.tokenPath,
+          JSON.stringify(updatedTokens, null, 2),
+          {
+            mode: 0o600,
+          },
+        );
         console.error("Tokens updated and saved");
       } catch (error: unknown) {
         // Handle case where currentTokens might not exist yet
-        if (error instanceof Error && 'code' in error && (error as any).code === 'ENOENT') { 
+        if (
+          error instanceof Error &&
+          "code" in error &&
+          (error as any).code === "ENOENT"
+        ) {
           try {
-             await fs.writeFile(this.tokenPath, JSON.stringify(newTokens, null, 2), { mode: 0o600 });
-             console.error("New tokens saved");
+            await fs.writeFile(
+              this.tokenPath,
+              JSON.stringify(newTokens, null, 2),
+              { mode: 0o600 },
+            );
+            console.error("New tokens saved");
           } catch (writeError) {
             console.error("Error saving initial tokens:", writeError);
           }
         } else {
-            console.error("Error saving updated tokens:", error);
+          console.error("Error saving updated tokens:", error);
         }
       }
     });
   }
 
+  private loadTokensFromEnv(): Credentials | null {
+    const jsonTokens = process.env.GOOGLE_DRIVE_MCP_TOKENS_JSON;
+    if (jsonTokens) {
+      try {
+        const parsed = JSON.parse(jsonTokens);
+        if (!parsed || typeof parsed !== "object") {
+          throw new Error("Token payload must be a JSON object");
+        }
+        return parsed;
+      } catch (error) {
+        throw new Error(
+          `Invalid GOOGLE_DRIVE_MCP_TOKENS_JSON: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    }
+
+    const base64Tokens =
+      process.env.GOOGLE_DRIVE_MCP_TOKENS_JSON_BASE64 ||
+      process.env.GOOGLE_DRIVE_MCP_TOKENS_BASE64;
+    if (base64Tokens) {
+      try {
+        const decoded = Buffer.from(base64Tokens, "base64").toString("utf-8");
+        const parsed = JSON.parse(decoded);
+        if (!parsed || typeof parsed !== "object") {
+          throw new Error("Token payload must be a JSON object");
+        }
+        return parsed;
+      } catch (error) {
+        throw new Error(
+          `Invalid GOOGLE_DRIVE_MCP_TOKENS_JSON_BASE64: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    }
+
+    return null;
+  }
+
   private async migrateLegacyTokens(): Promise<boolean> {
     // Check all possible legacy locations
     const legacyPaths = [getLegacyTokenPath(), ...getAdditionalLegacyPaths()];
-    
+
     for (const legacyPath of legacyPaths) {
       try {
         // Check if legacy tokens exist
-        if (!(await fs.access(legacyPath).then(() => true).catch(() => false))) {
+        if (
+          !(await fs
+            .access(legacyPath)
+            .then(() => true)
+            .catch(() => false))
+        ) {
           continue; // Try next location
         }
 
         // Read legacy tokens
         const legacyTokens = JSON.parse(await fs.readFile(legacyPath, "utf-8"));
-        
+
         if (!legacyTokens || typeof legacyTokens !== "object") {
-          console.error("Invalid legacy token format at", legacyPath, ", skipping");
+          console.error(
+            "Invalid legacy token format at",
+            legacyPath,
+            ", skipping",
+          );
           continue;
         }
 
         // Ensure new token directory exists
         await this.ensureTokenDirectoryExists();
-        
+
         // Copy to new location
-        await fs.writeFile(this.tokenPath, JSON.stringify(legacyTokens, null, 2), {
-          mode: 0o600,
-        });
-        
-        console.error("Migrated tokens from legacy location:", legacyPath, "to:", this.tokenPath);
-        
+        await fs.writeFile(
+          this.tokenPath,
+          JSON.stringify(legacyTokens, null, 2),
+          {
+            mode: 0o600,
+          },
+        );
+
+        console.error(
+          "Migrated tokens from legacy location:",
+          legacyPath,
+          "to:",
+          this.tokenPath,
+        );
+
         // Optionally remove legacy file after successful migration
         try {
           await fs.unlink(legacyPath);
           console.error("Removed legacy token file");
         } catch (unlinkErr) {
-          console.error("Warning: Could not remove legacy token file:", unlinkErr);
+          console.error(
+            "Warning: Could not remove legacy token file:",
+            unlinkErr,
+          );
         }
-        
+
         return true;
       } catch (error) {
-        console.error("Error migrating legacy tokens from", legacyPath, ":", error);
+        console.error(
+          "Error migrating legacy tokens from",
+          legacyPath,
+          ":",
+          error,
+        );
         // Continue to next location
       }
     }
-    
+
     return false; // No legacy tokens found or migrated
   }
 
   async loadSavedTokens(): Promise<boolean> {
     try {
+      const envTokens = this.loadTokensFromEnv();
+      if (envTokens) {
+        this.usingEnvTokens = true;
+        this.oauth2Client.setCredentials(envTokens);
+        console.error("Tokens loaded from environment variables.");
+        return true;
+      }
+
       await this.ensureTokenDirectoryExists();
-      
+
       // Check if current token file exists
-      const tokenExists = await fs.access(this.tokenPath).then(() => true).catch(() => false);
-      
+      const tokenExists = await fs
+        .access(this.tokenPath)
+        .then(() => true)
+        .catch(() => false);
+
       // If no current tokens, try to migrate from legacy location
       if (!tokenExists) {
         const migrated = await this.migrateLegacyTokens();
@@ -133,26 +244,32 @@ export class TokenManager {
       }
 
       this.oauth2Client.setCredentials(tokens);
-      console.error('Tokens loaded and set on OAuth2Client:', {
+      console.error("Tokens loaded and set on OAuth2Client:", {
         hasAccessToken: !!tokens.access_token,
         hasRefreshToken: !!tokens.refresh_token,
         tokenLength: tokens.access_token?.length,
         expiryDate: tokens.expiry_date,
-        scope: tokens.scope
+        scope: tokens.scope,
       });
-      console.error('OAuth2Client after setCredentials:', {
+      console.error("OAuth2Client after setCredentials:", {
         hasCredentials: !!this.oauth2Client.credentials,
-        credentialsAccessToken: !!this.oauth2Client.credentials?.access_token
+        credentialsAccessToken: !!this.oauth2Client.credentials?.access_token,
       });
       return true;
     } catch (error: unknown) {
       console.error("Error loading tokens:", error);
       // Attempt to delete potentially corrupted token file
-      if (error instanceof Error && 'code' in error && (error as any).code !== 'ENOENT') { 
-          try { 
-              await fs.unlink(this.tokenPath); 
-              console.error("Removed potentially corrupted token file") 
-            } catch (unlinkErr) { /* ignore */ } 
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        (error as any).code !== "ENOENT"
+      ) {
+        try {
+          await fs.unlink(this.tokenPath);
+          console.error("Removed potentially corrupted token file");
+        } catch (unlinkErr) {
+          /* ignore */
+        }
       }
       return false;
     }
@@ -178,59 +295,93 @@ export class TokenManager {
         console.error("Token refreshed successfully");
         return true;
       } catch (refreshError) {
-        if (refreshError instanceof GaxiosError && refreshError.response?.data?.error === 'invalid_grant') {
-            console.error("Error refreshing auth token: Invalid grant. Token likely expired or revoked. Please re-authenticate.");
-            // Optionally clear the potentially invalid tokens here
-            await this.clearTokens(); 
-            return false; // Indicate failure due to invalid grant
+        if (
+          refreshError instanceof GaxiosError &&
+          refreshError.response?.data?.error === "invalid_grant"
+        ) {
+          console.error(
+            "Error refreshing auth token: Invalid grant. Token likely expired or revoked. Please re-authenticate.",
+          );
+          // Optionally clear the potentially invalid tokens here
+          await this.clearTokens();
+          return false; // Indicate failure due to invalid grant
         } else {
-            // Handle other refresh errors
-            console.error("Error refreshing auth token:", refreshError);
-            return false;
+          // Handle other refresh errors
+          console.error("Error refreshing auth token:", refreshError);
+          return false;
         }
       }
-    } else if (!this.oauth2Client.credentials.access_token && !this.oauth2Client.credentials.refresh_token) {
-        console.error("No access or refresh token available. Please re-authenticate.");
-        return false;
+    } else if (
+      !this.oauth2Client.credentials.access_token &&
+      !this.oauth2Client.credentials.refresh_token
+    ) {
+      console.error(
+        "No access or refresh token available. Please re-authenticate.",
+      );
+      return false;
     } else {
-        // Token is valid or no refresh token available
-        return true;
+      // Token is valid or no refresh token available
+      return true;
     }
   }
 
   async validateTokens(): Promise<boolean> {
-    if (!this.oauth2Client.credentials || !this.oauth2Client.credentials.access_token) {
-        // Try loading first if no credentials set
-        if (!(await this.loadSavedTokens())) {
-            return false; // No saved tokens to load
-        }
-        // Check again after loading
-        if (!this.oauth2Client.credentials || !this.oauth2Client.credentials.access_token) {
-            return false; // Still no token after loading
-        }
+    if (
+      !this.oauth2Client.credentials ||
+      !this.oauth2Client.credentials.access_token
+    ) {
+      // Try loading first if no credentials set
+      if (!(await this.loadSavedTokens())) {
+        return false; // No saved tokens to load
+      }
+      // Check again after loading
+      if (
+        !this.oauth2Client.credentials ||
+        !this.oauth2Client.credentials.access_token
+      ) {
+        return false; // Still no token after loading
+      }
     }
     return this.refreshTokensIfNeeded();
   }
 
   async saveTokens(tokens: Credentials): Promise<void> {
     try {
-        await this.ensureTokenDirectoryExists();
-        await fs.writeFile(this.tokenPath, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+      if (this.usingEnvTokens) {
         this.oauth2Client.setCredentials(tokens);
-        console.error("Tokens saved successfully to:", this.tokenPath);
+        console.error(
+          "Tokens saved in memory only (env token mode). Persist by updating GOOGLE_DRIVE_MCP_TOKENS_JSON or GOOGLE_DRIVE_MCP_TOKENS_JSON_BASE64.",
+        );
+        return;
+      }
+
+      await this.ensureTokenDirectoryExists();
+      await fs.writeFile(this.tokenPath, JSON.stringify(tokens, null, 2), {
+        mode: 0o600,
+      });
+      this.oauth2Client.setCredentials(tokens);
+      console.error("Tokens saved successfully to:", this.tokenPath);
     } catch (error: unknown) {
-        console.error("Error saving tokens:", error);
-        throw error;
+      console.error("Error saving tokens:", error);
+      throw error;
     }
   }
 
   async clearTokens(): Promise<void> {
     try {
       this.oauth2Client.setCredentials({}); // Clear in memory
+      if (this.usingEnvTokens) {
+        console.error("Cleared in-memory tokens (env token mode).");
+        return;
+      }
       await fs.unlink(this.tokenPath);
       console.error("Tokens cleared successfully");
     } catch (error: unknown) {
-      if (error instanceof Error && 'code' in error && (error as any).code === 'ENOENT') {
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        (error as any).code === "ENOENT"
+      ) {
         // File already gone, which is fine
         console.error("Token file already deleted");
       } else {

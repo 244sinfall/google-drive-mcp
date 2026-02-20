@@ -1,6 +1,6 @@
-import * as path from 'path';
-import * as os from 'os';
-import { fileURLToPath } from 'url';
+import * as path from "path";
+import * as os from "os";
+import { fileURLToPath } from "url";
 
 // Helper to get the project root directory reliably
 function getProjectRoot(): string {
@@ -21,11 +21,11 @@ export function getSecureTokenPath(): string {
   }
 
   // Use XDG Base Directory spec or fallback to ~/.config
-  const configHome = process.env.XDG_CONFIG_HOME || 
-    path.join(os.homedir(), '.config');
-  
-  const tokenDir = path.join(configHome, 'google-drive-mcp');
-  return path.join(tokenDir, 'tokens.json');
+  const configHome =
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+
+  const tokenDir = path.join(configHome, "google-drive-mcp");
+  return path.join(tokenDir, "tokens.json");
 }
 
 // Returns the legacy token path for backward compatibility
@@ -38,8 +38,8 @@ export function getLegacyTokenPath(): string {
 export function getAdditionalLegacyPaths(): string[] {
   return [
     process.env.GOOGLE_TOKEN_PATH,
-    path.join(process.cwd(), 'google-tokens.json'),
-    path.join(process.cwd(), '.gcp-saved-tokens.json')
+    path.join(process.cwd(), "google-tokens.json"),
+    path.join(process.cwd(), ".gcp-saved-tokens.json"),
   ].filter(Boolean) as string[];
 }
 
@@ -52,7 +52,7 @@ export function getKeysFilePath(): string {
   if (envCredentialsPath) {
     return path.resolve(envCredentialsPath);
   }
-  
+
   // Priority 2: Default file path
   const projectRoot = getProjectRoot();
   const keysPath = path.join(projectRoot, "gcp-oauth.keys.json");
@@ -75,12 +75,19 @@ OAuth credentials not found. Please provide credentials using one of these metho
    Set GOOGLE_DRIVE_OAUTH_CREDENTIALS to the path of your credentials file:
    export GOOGLE_DRIVE_OAUTH_CREDENTIALS="/path/to/gcp-oauth.keys.json"
 
-2. Default file path:
+2. Environment variable (raw JSON content):
+   Set GOOGLE_DRIVE_OAUTH_CREDENTIALS_JSON to the full OAuth credentials JSON.
+
+3. Environment variable (base64 JSON content):
+   Set GOOGLE_DRIVE_OAUTH_CREDENTIALS_JSON_BASE64 to base64-encoded OAuth credentials JSON.
+
+4. Default file path:
    Place your gcp-oauth.keys.json file in the package root directory.
 
 Token storage:
 - Tokens are saved to: ${getSecureTokenPath()}
 - To use a custom token location, set GOOGLE_DRIVE_MCP_TOKEN_PATH environment variable
+- To provide tokens via env, set GOOGLE_DRIVE_MCP_TOKENS_JSON or GOOGLE_DRIVE_MCP_TOKENS_JSON_BASE64
 
 To get OAuth credentials:
 1. Go to the Google Cloud Console (https://console.cloud.google.com/)

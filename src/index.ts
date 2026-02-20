@@ -1,22 +1,24 @@
 #!/usr/bin/env node
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
+  isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { google } from "googleapis";
 import type { drive_v3 } from "googleapis";
 import { v4 as uuidv4 } from 'uuid';
-import { authenticate, runAuthCommand, AuthServer, initializeOAuth2Client } from './auth.js';
+import { authenticate, runAuthCommand } from './auth.js';
 import { z } from 'zod';
 import { fileURLToPath } from 'url';
 import { readFileSync, createReadStream, existsSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { downloadDriveFile } from './download-file.js';
+import express from 'express';
 
 // Drive service - will be created with auth when needed
 let drive: any = null;
@@ -93,6 +95,22 @@ const BINARY_MIME_TYPES: Record<string, string> = {
 // Global auth client - will be initialized on first use
 let authClient: any = null;
 let authenticationPromise: Promise<any> | null = null;
+let streamableTransport: StreamableHTTPServerTransport | null = null;
+let transportInitializationPromise: Promise<StreamableHTTPServerTransport> | null = null;
+
+const HTTP_HOST = process.env.GOOGLE_DRIVE_MCP_HOST || '127.0.0.1';
+const HTTP_PORT = Number.parseInt(process.env.GOOGLE_DRIVE_MCP_PORT || '3000', 10);
+const HTTP_PATH = process.env.GOOGLE_DRIVE_MCP_PATH || '/mcp';
+const ENABLE_DNS_REBINDING_PROTECTION =
+  (process.env.GOOGLE_DRIVE_MCP_ENABLE_DNS_REBINDING_PROTECTION || '').toLowerCase() === 'true';
+const ALLOWED_HOSTS = (process.env.GOOGLE_DRIVE_MCP_ALLOWED_HOSTS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+const ALLOWED_ORIGINS = (process.env.GOOGLE_DRIVE_MCP_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 
 // Get package version
 const __filename = fileURLToPath(import.meta.url);
@@ -3675,7 +3693,7 @@ Usage:
 
 Commands:
   auth     Run the authentication flow
-  start    Start the MCP server (default)
+  start    Start the Streamable HTTP MCP server (default)
   version  Show version information
   help     Show this help message
 
@@ -3686,8 +3704,20 @@ Examples:
   npx @yourusername/google-drive-mcp
 
 Environment Variables:
-  GOOGLE_DRIVE_OAUTH_CREDENTIALS   Path to OAuth credentials file
-  GOOGLE_DRIVE_MCP_TOKEN_PATH      Path to store authentication tokens
+  GOOGLE_DRIVE_OAUTH_CREDENTIALS              Path to OAuth credentials file
+  GOOGLE_DRIVE_OAUTH_CREDENTIALS_JSON         OAuth credentials JSON content
+  GOOGLE_DRIVE_OAUTH_CREDENTIALS_JSON_BASE64  Base64 OAuth credentials JSON
+
+  GOOGLE_DRIVE_MCP_TOKEN_PATH                 Path to store authentication tokens
+  GOOGLE_DRIVE_MCP_TOKENS_JSON                OAuth tokens JSON content
+  GOOGLE_DRIVE_MCP_TOKENS_JSON_BASE64         Base64 OAuth tokens JSON
+
+  GOOGLE_DRIVE_MCP_HOST                       HTTP bind host (default: 127.0.0.1)
+  GOOGLE_DRIVE_MCP_PORT                       HTTP bind port (default: 3000)
+  GOOGLE_DRIVE_MCP_PATH                       MCP endpoint path (default: /mcp)
+  GOOGLE_DRIVE_MCP_ENABLE_DNS_REBINDING_PROTECTION  true|false (default: false)
+  GOOGLE_DRIVE_MCP_ALLOWED_HOSTS              Comma-separated host header allowlist
+  GOOGLE_DRIVE_MCP_ALLOWED_ORIGINS            Comma-separated origin header allowlist
 `);
 }
 
@@ -3695,47 +3725,202 @@ function showVersion(): void {
   console.log(`Google Drive MCP Server v${VERSION}`);
 }
 
-async function runAuthServer(): Promise<void> {
-  try {
-    // Initialize OAuth client
-    const oauth2Client = await initializeOAuth2Client();
-
-    // Create and start the auth server
-    const authServerInstance = new AuthServer(oauth2Client);
-
-    // Start with browser opening (true by default)
-    const success = await authServerInstance.start(true);
-
-    if (!success && !authServerInstance.authCompletedSuccessfully) {
-      // Failed to start and tokens weren't already valid
-      console.error(
-        "Authentication failed. Could not start server or validate existing tokens. Check port availability (3000-3004) and try again."
-      );
-      process.exit(1);
-    } else if (authServerInstance.authCompletedSuccessfully) {
-      // Auth was successful (either existing tokens were valid or flow completed just now)
-      console.log("Authentication successful.");
-      process.exit(0); // Exit cleanly if auth is already done
-    }
-
-    // If we reach here, the server started and is waiting for the browser callback
-    console.log(
-      "Authentication server started. Please complete the authentication in your browser..."
-    );
-
-    // Wait for completion
-    const intervalId = setInterval(async () => {
-      if (authServerInstance.authCompletedSuccessfully) {
-        clearInterval(intervalId);
-        await authServerInstance.stop();
-        console.log("Authentication completed successfully!");
-        process.exit(0);
-      }
-    }, 1000);
-  } catch (error) {
-    console.error("Authentication failed:", error);
-    process.exit(1);
+function isInitializePayload(payload: unknown): boolean {
+  if (Array.isArray(payload)) {
+    return payload.some((message) => isInitializeRequest(message));
   }
+  return isInitializeRequest(payload);
+}
+
+function createBadRequestResponse(message: string): {
+  jsonrpc: string;
+  error: { code: number; message: string };
+  id: null;
+} {
+  return {
+    jsonrpc: '2.0',
+    error: {
+      code: -32000,
+      message,
+    },
+    id: null,
+  };
+}
+
+async function createTransportAndConnectServer(): Promise<StreamableHTTPServerTransport> {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => uuidv4(),
+    enableDnsRebindingProtection: ENABLE_DNS_REBINDING_PROTECTION,
+    allowedHosts: ALLOWED_HOSTS.length ? ALLOWED_HOSTS : undefined,
+    allowedOrigins: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : undefined,
+  });
+
+  transport.onclose = () => {
+    log('Streamable HTTP transport closed');
+    streamableTransport = null;
+  };
+  transport.onerror = (error: Error) => {
+    log('Streamable HTTP transport error', { error: error.message });
+  };
+
+  await server.connect(transport);
+  streamableTransport = transport;
+  return transport;
+}
+
+async function ensureStreamableTransport(): Promise<StreamableHTTPServerTransport> {
+  if (streamableTransport) {
+    return streamableTransport;
+  }
+  if (transportInitializationPromise) {
+    return transportInitializationPromise;
+  }
+
+  transportInitializationPromise = createTransportAndConnectServer().finally(
+    () => {
+      transportInitializationPromise = null;
+    },
+  );
+  return transportInitializationPromise;
+}
+
+async function getTransportForRequest(
+  method: string,
+  requestBody: unknown,
+): Promise<StreamableHTTPServerTransport | null> {
+  if (streamableTransport) {
+    return streamableTransport;
+  }
+
+  if (method === 'POST' && isInitializePayload(requestBody)) {
+    return ensureStreamableTransport();
+  }
+
+  return null;
+}
+
+function installGracefulShutdown(httpServer: import('http').Server): void {
+  let shutdownStarted = false;
+
+  const shutdown = async (signal: string) => {
+    if (shutdownStarted) {
+      return;
+    }
+    shutdownStarted = true;
+    log(`Received ${signal}. Shutting down.`);
+
+    try {
+      if (streamableTransport) {
+        await streamableTransport.close();
+        streamableTransport = null;
+      }
+      await server.close();
+      await new Promise<void>((resolve, reject) => {
+        httpServer.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+      process.exit(0);
+    } catch (error) {
+      console.error('Failed to shut down cleanly:', error);
+      process.exit(1);
+    }
+  };
+
+  process.on('SIGINT', () => {
+    void shutdown('SIGINT');
+  });
+  process.on('SIGTERM', () => {
+    void shutdown('SIGTERM');
+  });
+}
+
+async function startHttpServer(): Promise<void> {
+  if (!Number.isInteger(HTTP_PORT) || HTTP_PORT < 1 || HTTP_PORT > 65535) {
+    throw new Error(
+      `Invalid GOOGLE_DRIVE_MCP_PORT value: ${process.env.GOOGLE_DRIVE_MCP_PORT}`,
+    );
+  }
+
+  const app = express();
+  app.use(express.json({ limit: '4mb' }));
+
+  app.get('/healthz', (_req, res) => {
+    res.status(200).json({
+      status: 'ok',
+      transportInitialized: !!streamableTransport,
+    });
+  });
+
+  const handleMcpRequest = async (
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> => {
+    try {
+      const transport = await getTransportForRequest(req.method, req.body);
+      if (!transport) {
+        res
+          .status(400)
+          .json(
+            createBadRequestResponse(
+              'Bad Request: Server not initialized. Send an initialize request first.',
+            ),
+          );
+        return;
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      log('Error handling MCP HTTP request', {
+        method: req.method,
+        path: req.path,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32603,
+            message: 'Internal server error',
+          },
+          id: null,
+        });
+      }
+    }
+  };
+
+  app.post(HTTP_PATH, handleMcpRequest);
+  app.get(HTTP_PATH, handleMcpRequest);
+  app.delete(HTTP_PATH, handleMcpRequest);
+
+  app.all(HTTP_PATH, (_req, res) => {
+    res.status(405).json({
+      jsonrpc: '2.0',
+      error: {
+        code: -32000,
+        message: 'Method not allowed.',
+      },
+      id: null,
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const httpServer = app.listen(HTTP_PORT, HTTP_HOST, () => {
+      installGracefulShutdown(httpServer);
+      log('Streamable HTTP MCP server listening', {
+        host: HTTP_HOST,
+        port: HTTP_PORT,
+        path: HTTP_PATH,
+      });
+      resolve();
+    });
+    httpServer.on('error', reject);
+  });
 }
 
 // -----------------------------------------------------------------------------
@@ -3770,28 +3955,15 @@ async function main() {
 
   switch (command) {
     case "auth":
-      await runAuthServer();
+      await runAuthCommand();
       break;
     case "start":
     case undefined:
       try {
-        // Start the MCP server
-        console.error("Starting Google Drive MCP server...");
-        const transport = new StdioServerTransport();
-        await server.connect(transport);
-        log('Server started successfully');
-        
-        // Set up graceful shutdown
-        process.on("SIGINT", async () => {
-          await server.close();
-          process.exit(0);
-        });
-        process.on("SIGTERM", async () => {
-          await server.close();
-          process.exit(0);
-        });
+        console.error("Starting Google Drive MCP server (Streamable HTTP)...");
+        await startHttpServer();
       } catch (error) {
-        console.error('Failed to start server:', error);
+        console.error("Failed to start server:", error);
         process.exit(1);
       }
       break;
