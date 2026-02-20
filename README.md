@@ -228,10 +228,10 @@ Notes:
 ### 1) Build image
 
 ```bash
-npm install
-npm run build
 docker build -t google-drive-mcp .
 ```
+
+The Docker build now compiles the project inside the image; no local `dist/` is required.
 
 ### 2) Run container
 

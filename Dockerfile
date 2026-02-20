@@ -1,17 +1,21 @@
-# Use Node.js LTS as base image
-FROM node:20-slim
+# Build stage: compile TypeScript to dist/
+FROM node:20-slim AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
 
-# Set working directory
+# Runtime stage: production deps + compiled output
+FROM node:20-slim AS runtime
 WORKDIR /app
 
-# Copy package files
+# Install only production dependencies
 COPY package*.json ./
+RUN npm ci --omit=dev --ignore-scripts
 
-# Install production dependencies only, skipping lifecycle scripts
-RUN npm ci --only=production --ignore-scripts
-
-# Copy built distribution files
-COPY dist ./dist
+# Copy compiled app from build stage
+COPY --from=build /app/dist ./dist
 
 # Create directory for config files
 RUN mkdir -p /config
