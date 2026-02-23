@@ -95,8 +95,6 @@ const BINARY_MIME_TYPES: Record<string, string> = {
 // Global auth client - will be initialized on first use
 let authClient: any = null;
 let authenticationPromise: Promise<any> | null = null;
-let streamableTransport: StreamableHTTPServerTransport | null = null;
-let transportInitializationPromise: Promise<StreamableHTTPServerTransport> | null = null;
 
 const HTTP_HOST = process.env.GOOGLE_DRIVE_MCP_HOST || '127.0.0.1';
 const HTTP_PORT = Number.parseInt(process.env.GOOGLE_DRIVE_MCP_PORT || '3000', 10);
@@ -616,20 +614,8 @@ const DownloadFileSchema = z.object({
 });
 
 // -----------------------------------------------------------------------------
-// SERVER SETUP
+// SERVER SETUP (default server created after registerMcpHandlers)
 // -----------------------------------------------------------------------------
-const server = new Server(
-  {
-    name: "google-drive-mcp",
-    version: VERSION,
-  },
-  {
-    capabilities: {
-      resources: {},
-      tools: {},
-    },
-  },
-);
 
 // -----------------------------------------------------------------------------
 // AUTHENTICATION HELPER
@@ -667,10 +653,11 @@ async function ensureAuthenticated() {
 }
 
 // -----------------------------------------------------------------------------
-// MCP REQUEST HANDLERS
+// MCP REQUEST HANDLERS (shared by all session servers)
 // -----------------------------------------------------------------------------
 
-server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
+function registerMcpHandlers(s: Server): void {
+  s.setRequestHandler(ListResourcesRequestSchema, async (request) => {
   await ensureAuthenticated();
   log('Handling ListResources request', { params: request.params });
   const pageSize = 10;
@@ -707,7 +694,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
   };
 });
 
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  s.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   await ensureAuthenticated();
   log('Handling ReadResource request', { uri: request.params.uri });
   const fileId = request.params.uri.replace("gdrive:///", "");
@@ -781,7 +768,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   }
 });
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+  s.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
@@ -1521,11 +1508,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// -----------------------------------------------------------------------------
-// TOOL CALL REQUEST HANDLER
-// -----------------------------------------------------------------------------
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  // -----------------------------------------------------------------------------
+  // TOOL CALL REQUEST HANDLER
+  // -----------------------------------------------------------------------------
+  s.setRequestHandler(CallToolRequestSchema, async (request) => {
   console.error(`[DEBUG] CallTool handler called for tool: ${request.params.name}`);
   await ensureAuthenticated();
   console.error(`[DEBUG] After ensureAuthenticated - authClient exists: ${!!authClient}, drive exists: ${!!drive}`);
@@ -3679,6 +3665,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return errorResponse((error as Error).message);
   }
 });
+}
+
+// Create the default server instance (used for graceful shutdown and backward compat)
+const server = new Server(
+  {
+    name: "google-drive-mcp",
+    version: VERSION,
+  },
+  {
+    capabilities: {
+      resources: {},
+      tools: {},
+    },
+  },
+);
+registerMcpHandlers(server);
+
+/** Creates a new MCP server instance for a session (each session gets its own server to avoid "Server already initialized"). */
+function createMcpServer(): Server {
+  const s = new Server(
+    { name: "google-drive-mcp", version: VERSION },
+    { capabilities: { resources: {}, tools: {} } },
+  );
+  registerMcpHandlers(s);
+  return s;
+}
+
+/** Per-session state: one Server + one Transport per client session (supports concurrent requests from gateway). */
+interface SessionState {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+}
+const sessions = new Map<string, SessionState>();
 
 // -----------------------------------------------------------------------------
 // CLI FUNCTIONS
@@ -3747,56 +3766,49 @@ function createBadRequestResponse(message: string): {
   };
 }
 
-async function createTransportAndConnectServer(): Promise<StreamableHTTPServerTransport> {
+/** Get or create the transport for this request (by Mcp-Session-Id). One server+transport per session so concurrent clients don't get "Server already initialized". */
+async function getTransportForRequest(
+  req: express.Request,
+  requestBody: unknown,
+): Promise<StreamableHTTPServerTransport | null> {
+  const sessionIdHeader = req.headers['mcp-session-id'];
+  const sessionId = typeof sessionIdHeader === 'string' ? sessionIdHeader.trim() : null;
+
+  if (sessionId) {
+    const state = sessions.get(sessionId);
+    if (state) {
+      return state.transport;
+    }
+    // Known session ID but no state: session expired or from another replica
+    log('Unknown or expired session', { sessionId });
+    return null;
+  }
+
+  // New session: only allow initialize request
+  if (req.method !== 'POST' || !isInitializePayload(requestBody)) {
+    return null;
+  }
+
+  const newSessionId = uuidv4();
+  const sessionServer = createMcpServer();
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => uuidv4(),
+    sessionIdGenerator: () => newSessionId,
     enableDnsRebindingProtection: ENABLE_DNS_REBINDING_PROTECTION,
     allowedHosts: ALLOWED_HOSTS.length ? ALLOWED_HOSTS : undefined,
     allowedOrigins: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : undefined,
   });
 
   transport.onclose = () => {
-    log('Streamable HTTP transport closed');
-    streamableTransport = null;
+    sessions.delete(newSessionId);
+    log('Session closed', { sessionId: newSessionId });
   };
   transport.onerror = (error: Error) => {
-    log('Streamable HTTP transport error', { error: error.message });
+    log('Streamable HTTP transport error', { sessionId: newSessionId, error: error.message });
   };
 
-  await server.connect(transport);
-  streamableTransport = transport;
+  await sessionServer.connect(transport);
+  sessions.set(newSessionId, { server: sessionServer, transport });
   return transport;
-}
-
-async function ensureStreamableTransport(): Promise<StreamableHTTPServerTransport> {
-  if (streamableTransport) {
-    return streamableTransport;
-  }
-  if (transportInitializationPromise) {
-    return transportInitializationPromise;
-  }
-
-  transportInitializationPromise = createTransportAndConnectServer().finally(
-    () => {
-      transportInitializationPromise = null;
-    },
-  );
-  return transportInitializationPromise;
-}
-
-async function getTransportForRequest(
-  method: string,
-  requestBody: unknown,
-): Promise<StreamableHTTPServerTransport | null> {
-  if (streamableTransport) {
-    return streamableTransport;
-  }
-
-  if (method === 'POST' && isInitializePayload(requestBody)) {
-    return ensureStreamableTransport();
-  }
-
-  return null;
 }
 
 function installGracefulShutdown(httpServer: import('http').Server): void {
@@ -3810,9 +3822,13 @@ function installGracefulShutdown(httpServer: import('http').Server): void {
     log(`Received ${signal}. Shutting down.`);
 
     try {
-      if (streamableTransport) {
-        await streamableTransport.close();
-        streamableTransport = null;
+      for (const [sessionId, state] of sessions.entries()) {
+        try {
+          await state.transport.close();
+        } catch (err) {
+          log('Error closing session transport', { sessionId, error: (err as Error).message });
+        }
+        sessions.delete(sessionId);
       }
       await server.close();
       await new Promise<void>((resolve, reject) => {
@@ -3852,7 +3868,7 @@ async function startHttpServer(): Promise<void> {
   app.get('/healthz', (_req, res) => {
     res.status(200).json({
       status: 'ok',
-      transportInitialized: !!streamableTransport,
+      sessions: sessions.size,
     });
   });
 
@@ -3861,15 +3877,13 @@ async function startHttpServer(): Promise<void> {
     res: express.Response,
   ): Promise<void> => {
     try {
-      const transport = await getTransportForRequest(req.method, req.body);
+      const transport = await getTransportForRequest(req, req.body);
       if (!transport) {
-        res
-          .status(400)
-          .json(
-            createBadRequestResponse(
-              'Bad Request: Server not initialized. Send an initialize request first.',
-            ),
-          );
+        const sessionId = req.headers['mcp-session-id'];
+        const message = sessionId
+          ? 'Bad Request: Unknown or expired session. Send an initialize request to start a new session.'
+          : 'Bad Request: Server not initialized. Send an initialize request first.';
+        res.status(400).json(createBadRequestResponse(message));
         return;
       }
 
