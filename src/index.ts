@@ -218,6 +218,51 @@ function validateTextFileExtension(name: string) {
   }
 }
 
+function extractGoogleDocPlainText(documentData: any): string {
+  const extractFromBodyContent = (bodyContent: any[] | null | undefined) => {
+    let text = '';
+    if (!bodyContent) return text;
+
+    for (const element of bodyContent) {
+      if (element.paragraph?.elements) {
+        for (const textElement of element.paragraph.elements) {
+          if (textElement.textRun?.content) {
+            text += textElement.textRun.content;
+          }
+        }
+      }
+    }
+
+    return text;
+  };
+
+  const tabs: any[] | undefined = documentData?.tabs;
+  if (Array.isArray(tabs) && tabs.length > 0) {
+    let combined = '';
+    for (let tabIndex = 0; tabIndex < tabs.length; tabIndex++) {
+      const tab = tabs[tabIndex];
+      const tabId = tab?.tabProperties?.tabId ?? tab?.tabId ?? `tab-${tabIndex + 1}`;
+      const tabTitle =
+        tab?.tabProperties?.title ??
+        tab?.tabProperties?.name ??
+        tab?.title ??
+        tabId;
+
+      const tabBodyContent =
+        tab?.documentTab?.body?.content ??
+        tab?.body?.content ??
+        tab?.content ??
+        null;
+
+      const tabText = extractFromBodyContent(tabBodyContent);
+      combined += `\n\n=== Tab ${tabIndex + 1}: ${tabTitle} ===\n\n${tabText}`;
+    }
+    return combined.trimStart();
+  }
+
+  return extractFromBodyContent(documentData?.body?.content);
+}
+
 /**
  * Convert A1 notation to GridRange for Google Sheets API
  */
@@ -719,6 +764,25 @@ function registerMcpHandlers(s: Server): void {
       case "application/vnd.google-apps.presentation": exportMimeType = "text/plain"; break;
       case "application/vnd.google-apps.drawing": exportMimeType = "image/png"; break;
       default: exportMimeType = "text/plain"; break;
+    }
+
+    // Google Docs export currently drops content in tabbed docs. Prefer Docs API
+    // extraction for docs to ensure all tabs are included.
+    if (mimeType === "application/vnd.google-apps.document") {
+      const docs = google.docs({ version: 'v1', auth: authClient });
+      const doc = await docs.documents.get({ documentId: fileId });
+      const text = extractGoogleDocPlainText(doc.data as any);
+
+      log('Successfully read resource', { fileId, mimeType });
+      return {
+        contents: [
+          {
+            uri: request.params.uri,
+            mimeType: exportMimeType,
+            text,
+          },
+        ],
+      };
     }
 
     const res = await drive.files.export(
@@ -2903,49 +2967,95 @@ function registerMcpHandlers(s: Server): void {
 
         const docs = google.docs({ version: 'v1', auth: authClient });
         const document = await docs.documents.get({ documentId: args.documentId });
-        
-        let content = '';
-        let currentIndex = 1;
-        const segments: Array<{text: string, startIndex: number, endIndex: number}> = [];
-        
-        // Extract text content with indices
-        if (document.data.body?.content) {
-          for (const element of document.data.body.content) {
+
+        const extractText = (bodyContent: any[] | null | undefined) => {
+          let text = '';
+          let currentIndex = 1;
+          const segments: Array<{ text: string; startIndex: number; endIndex: number }> = [];
+
+          if (!bodyContent) return { text, segments };
+
+          for (const element of bodyContent) {
             if (element.paragraph?.elements) {
               for (const textElement of element.paragraph.elements) {
                 if (textElement.textRun?.content) {
-                  const text = textElement.textRun.content;
+                  const runText = textElement.textRun.content;
                   segments.push({
-                    text,
+                    text: runText,
                     startIndex: currentIndex,
-                    endIndex: currentIndex + text.length
+                    endIndex: currentIndex + runText.length
                   });
-                  content += text;
-                  currentIndex += text.length;
+                  text += runText;
+                  currentIndex += runText.length;
                 }
               }
             }
           }
-        }
-        
-        // Format the response to show text with indices
-        let formattedContent = 'Document content with indices:\n\n';
-        let lineStart = 1;
-        const lines = content.split('\n');
-        
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-          const lineEnd = lineStart + line.length;
-          if (line.trim()) {
-            formattedContent += `[${lineStart}-${lineEnd}] ${line}\n`;
+
+          return { text, segments };
+        };
+
+        const formatWithIndices = (label: string, text: string) => {
+          let formattedContent = `${label} content with indices:\n\n`;
+          let lineStart = 1;
+          const lines = text.split('\n');
+
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const lineEnd = lineStart + line.length;
+            if (line.trim()) {
+              formattedContent += `[${lineStart}-${lineEnd}] ${line}\n`;
+            }
+            lineStart = lineEnd + 1; // +1 for the newline character
           }
-          lineStart = lineEnd + 1; // +1 for the newline character
+
+          return formattedContent;
+        };
+
+        // Tabbed Google Docs: extract each tab body (if present). Fallback to the
+        // legacy non-tabbed document body.
+        const tabs: any[] | undefined = (document.data as any)?.tabs;
+
+        let combinedText = '';
+        let formattedContent = '';
+
+        if (Array.isArray(tabs) && tabs.length > 0) {
+          formattedContent += `Document has ${tabs.length} tabs.\n\n`;
+
+          for (let tabIndex = 0; tabIndex < tabs.length; tabIndex++) {
+            const tab = tabs[tabIndex];
+            const tabId = tab?.tabProperties?.tabId ?? tab?.tabId ?? `tab-${tabIndex + 1}`;
+            const tabTitle =
+              tab?.tabProperties?.title ??
+              tab?.tabProperties?.name ??
+              tab?.title ??
+              tabId;
+
+            const tabBodyContent =
+              tab?.documentTab?.body?.content ??
+              tab?.body?.content ??
+              tab?.content ??
+              null;
+
+            const { text } = extractText(tabBodyContent);
+            const label = `Tab ${tabIndex + 1}: ${tabTitle}`;
+
+            formattedContent += `=== ${label} ===\n`;
+            formattedContent += formatWithIndices(label, text);
+            formattedContent += `\n`;
+
+            combinedText += `${text}\n`;
+          }
+        } else {
+          const { text } = extractText(document.data.body?.content);
+          combinedText = text;
+          formattedContent = formatWithIndices('Document', combinedText);
         }
-        
+
         return {
           content: [{
             type: "text",
-            text: formattedContent + `\nTotal length: ${content.length} characters`
+            text: formattedContent + `\nTotal length: ${combinedText.length} characters`
           }],
           isError: false
         };
