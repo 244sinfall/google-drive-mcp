@@ -236,11 +236,23 @@ function extractGoogleDocPlainText(documentData: any): string {
     return text;
   };
 
-  const tabs: any[] | undefined = documentData?.tabs;
-  if (Array.isArray(tabs) && tabs.length > 0) {
+  const collectTabsDepthFirst = (tabs: any[] | undefined, out: any[]) => {
+    if (!Array.isArray(tabs)) return;
+    for (const tab of tabs) {
+      out.push(tab);
+      if (Array.isArray(tab?.childTabs) && tab.childTabs.length > 0) {
+        collectTabsDepthFirst(tab.childTabs, out);
+      }
+    }
+  };
+
+  const flatTabs: any[] = [];
+  collectTabsDepthFirst(documentData?.tabs, flatTabs);
+
+  if (flatTabs.length > 0) {
     let combined = '';
-    for (let tabIndex = 0; tabIndex < tabs.length; tabIndex++) {
-      const tab = tabs[tabIndex];
+    for (let tabIndex = 0; tabIndex < flatTabs.length; tabIndex++) {
+      const tab = flatTabs[tabIndex];
       const tabId = tab?.tabProperties?.tabId ?? tab?.tabId ?? `tab-${tabIndex + 1}`;
       const tabTitle =
         tab?.tabProperties?.title ??
@@ -770,7 +782,7 @@ function registerMcpHandlers(s: Server): void {
     // extraction for docs to ensure all tabs are included.
     if (mimeType === "application/vnd.google-apps.document") {
       const docs = google.docs({ version: 'v1', auth: authClient });
-      const doc = await docs.documents.get({ documentId: fileId });
+      const doc = await docs.documents.get({ documentId: fileId, includeTabsContent: true });
       const text = extractGoogleDocPlainText(doc.data as any);
 
       log('Successfully read resource', { fileId, mimeType });
@@ -1989,7 +2001,7 @@ function registerMcpHandlers(s: Server): void {
         const args = validation.data;
 
         const docs = google.docs({ version: 'v1', auth: authClient });
-        const document = await docs.documents.get({ documentId: args.documentId });
+        const document = await docs.documents.get({ documentId: args.documentId, includeTabsContent: true });
 
         // Delete all content
         // End index of last piece of content (body's last element, fallback to 1 if none)
@@ -2966,7 +2978,7 @@ function registerMcpHandlers(s: Server): void {
         const args = validation.data;
 
         const docs = google.docs({ version: 'v1', auth: authClient });
-        const document = await docs.documents.get({ documentId: args.documentId });
+        const document = await docs.documents.get({ documentId: args.documentId, includeTabsContent: true });
 
         const extractText = (bodyContent: any[] | null | undefined) => {
           let text = '';
